@@ -1,0 +1,7 @@
+python-telegram-bot==21.10
+edge-tts
+gTTS
+pypdf
+python-docx
+EbookLib
+beautifulsoup4
