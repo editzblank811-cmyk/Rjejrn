@@ -1,0 +1,129 @@
+name: Telegram TTS Bot
+
+# Manual start only (no cron): the bot is NOT kept running 24/7.
+# Each run lasts ~348 min; users get an alert at 340 min, then the bot stops.
+# To restart: GitHub -> Actions -> "Telegram TTS Bot" -> Run workflow.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-tts-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # hard safety net; bot stops itself at SESSION_MINUTES
+    env:
+      PYTHONUNBUFFERED: "1"
+      LOCAL_BOT_API: "true"
+      LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
+      LOCAL_API_CONTAINER: "telegram-bot-api"
+      SEND_PART_MB: "1800"
+      MAX_PART_HOURS: "10"
+      BATCH_CHUNKS: "240"
+      TTS_CONCURRENCY: "10"
+      DEFAULT_VOICE: "hi-IN-MadhurNeural"
+      DEFAULT_RATE: "2.0"
+      SESSION_MINUTES: "348"
+      ALERT_BEFORE_MIN: "8"     # alert at 348 - 8 = 340 minutes
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install --upgrade pip
+
+      - name: Check Docker
+        run: |
+          set -e
+          docker --version
+          sudo docker info
+
+      - name: Install Python dependencies
+        run: |
+          set -e
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install \
+              "python-telegram-bot==21.10" \
+              edge-tts gTTS pypdf python-docx EbookLib beautifulsoup4
+          fi
+
+      - name: Start Local Telegram Bot API
+        env:
+          TELEGRAM_API_ID: ${{ secrets.API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${BOT_TOKEN:?Missing BOT_TOKEN repository secret}"
+          : "${TELEGRAM_API_ID:?Missing API_ID repository secret}"
+          : "${TELEGRAM_API_HASH:?Missing API_HASH repository secret}"
+
+          sudo docker rm -f telegram-bot-api 2>/dev/null || true
+          sudo docker run -d \
+            --name telegram-bot-api \
+            -p 127.0.0.1:8081:8081 \
+            -e TELEGRAM_API_ID="${TELEGRAM_API_ID}" \
+            -e TELEGRAM_API_HASH="${TELEGRAM_API_HASH}" \
+            -v telegram-bot-api-data:/var/lib/telegram-bot-api \
+            aiogram/telegram-bot-api:latest \
+            --api-id="${TELEGRAM_API_ID}" \
+            --api-hash="${TELEGRAM_API_HASH}" \
+            --local
+
+          ready=0
+          for i in $(seq 1 30); do
+            running="$(sudo docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null || echo false)"
+            if [ "${running}" != "true" ]; then
+              sudo docker logs --tail 100 telegram-bot-api || true
+              exit 1
+            fi
+            if curl -sS --max-time 2 http://127.0.0.1:8081/ >/dev/null 2>&1; then
+              ready=1
+              echo "Local Bot API is responding."
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${ready}" -ne 1 ]; then
+            echo "::error::Local Bot API did not respond on port 8081."
+            sudo docker logs --tail 100 telegram-bot-api || true
+            exit 1
+          fi
+
+      - name: Run Telegram bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          # Optional secret: your Telegram user id(s), e.g. "123456789" or "111,222".
+          # Needed so the start/340-min alerts reach you even before you message the bot.
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+        run: |
+          set -euo pipefail
+          : "${BOT_TOKEN:?Missing BOT_TOKEN repository secret}"
+          python -u bot.py
+
+      - name: Show Local Bot API logs if job fails
+        if: failure()
+        run: sudo docker logs --tail 100 telegram-bot-api || true
+
+      - name: Stop Local Telegram Bot API
+        if: always()
+        run: sudo docker rm -f telegram-bot-api || true
