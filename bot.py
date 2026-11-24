@@ -1407,7 +1407,10 @@ def cleanup_stale_workdirs():
 
 def wait_for_bot_api(max_wait=300):
     """Block until the (local) Bot API answers getMe. Its port opens before it has
-    finished connecting to Telegram, and PTB's default 5 s timeout then kills startup."""
+    finished connecting to Telegram, and PTB's default 5 s timeout then kills startup.
+
+    On HTTP 429 the server tells us how long to wait (parameters.retry_after); we
+    honour that fully instead of retrying early and extending the flood wait."""
     import json as _json
     import urllib.error
     import urllib.request
@@ -1431,13 +1434,19 @@ def wait_for_bot_api(max_wait=300):
                     pause = int(_json.loads(exc.read()).get("parameters", {}).get("retry_after", 5)) + 1
                 except Exception:
                     pause = 5
-            log.warning("Bot API getMe returned HTTP %s (attempt %s).", exc.code, attempt)
+                log.warning("Bot API getMe returned HTTP 429 (attempt %s); rate limited, waiting %ss.",
+                            attempt, pause)
+                # a long flood wait may exceed max_wait: extend the deadline so we don't give up early
+                deadline = max(deadline, time.monotonic() + pause + 30)
+            else:
+                log.warning("Bot API getMe returned HTTP %s (attempt %s); retrying in %ss.",
+                            exc.code, attempt, pause)
         except Exception as exc:                      # timeout / connection refused while it starts
             log.info("Waiting for Bot API… (%s, attempt %s)", type(exc).__name__, attempt)
         if time.monotonic() > deadline:
             log.warning("Bot API still not answering after %ss; trying to start anyway.", max_wait)
             return
-        time.sleep(min(pause, 60))
+        time.sleep(min(pause, 900))
 
 
 def main():
