@@ -19,7 +19,7 @@ from ebooklib import epub, ITEM_DOCUMENT
 from bs4 import BeautifulSoup
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application, ApplicationHandlerStop, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, TypeHandler, filters,
@@ -36,6 +36,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "0").lower() in {"1", "true", "yes"}
 LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL", "http://127.0.0.1:8081").rstrip("/")
 LOCAL_API_CONTAINER = os.getenv("LOCAL_API_CONTAINER", "telegram-bot-api")
+# How long to wait for the local Bot API to log in to Telegram (flood waits can take minutes).
+BOT_API_MAX_WAIT = int(os.getenv("BOT_API_MAX_WAIT", "900"))
+# Per-request timeout for getMe. Must be LONGER than Telegram's flood wait (~30-60 s),
+# otherwise every request is aborted just before it would succeed.
+BOT_API_REQUEST_TIMEOUT = int(os.getenv("BOT_API_REQUEST_TIMEOUT", "120"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1900" if LOCAL_BOT_API else "50"))
 MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "20"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
@@ -1405,12 +1410,20 @@ def cleanup_stale_workdirs():
         shutil.rmtree(old, ignore_errors=True)
 
 
-def wait_for_bot_api(max_wait=300):
-    """Block until the (local) Bot API answers getMe. Its port opens before it has
-    finished connecting to Telegram, and PTB's default 5 s timeout then kills startup.
+# ───────────────────────── startup ─────────────────────────
 
-    On HTTP 429 the server tells us how long to wait (parameters.retry_after); we
-    honour that fully instead of retrying early and extending the flood wait."""
+def wait_for_bot_api(max_wait=BOT_API_MAX_WAIT, request_timeout=BOT_API_REQUEST_TIMEOUT):
+    """Block until the (local) Bot API answers getMe.
+
+    The local server opens its port before it has logged in to Telegram. If Telegram
+    flood-limits that login, getMe is held for the whole flood wait (~30-60 s). The
+    request timeout must therefore be LONGER than the flood wait; with a short timeout
+    every request is aborted just before it would succeed and each retry re-triggers
+    the wait forever.
+
+    On HTTP 429 we sleep for the server's retry_after. If the API is still not ready
+    after max_wait we exit with a clear message instead of starting a bot that is
+    guaranteed to crash with RetryAfter."""
     import json as _json
     import urllib.error
     import urllib.request
@@ -1422,7 +1435,7 @@ def wait_for_bot_api(max_wait=300):
         attempt += 1
         pause = 3
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:
+            with urllib.request.urlopen(url, timeout=request_timeout) as resp:
                 if resp.status == 200:
                     log.info("Local Bot API is ready (attempt %s).", attempt)
                     return
@@ -1431,30 +1444,25 @@ def wait_for_bot_api(max_wait=300):
                 raise SystemExit("Bot API rejected BOT_TOKEN (401/404). Check the BOT_TOKEN secret.")
             if exc.code == 429:
                 try:
-                    pause = int(_json.loads(exc.read()).get("parameters", {}).get("retry_after", 5)) + 1
+                    pause = int(_json.loads(exc.read()).get("parameters", {}).get("retry_after", 10)) + 2
                 except Exception:
-                    pause = 5
-                log.warning("Bot API getMe returned HTTP 429 (attempt %s); rate limited, waiting %ss.",
-                            attempt, pause)
-                # a long flood wait may exceed max_wait: extend the deadline so we don't give up early
-                deadline = max(deadline, time.monotonic() + pause + 30)
+                    pause = 10
+                log.warning("Bot API getMe returned HTTP 429 (attempt %s); waiting %ss.", attempt, pause)
             else:
                 log.warning("Bot API getMe returned HTTP %s (attempt %s); retrying in %ss.",
                             exc.code, attempt, pause)
-        except Exception as exc:                      # timeout / connection refused while it starts
+        except Exception as exc:                      # connection refused / timeout while it starts
             log.info("Waiting for Bot API… (%s, attempt %s)", type(exc).__name__, attempt)
-        if time.monotonic() > deadline:
-            log.warning("Bot API still not answering after %ss; trying to start anyway.", max_wait)
-            return
-        time.sleep(min(pause, 900))
+        if time.monotonic() + pause > deadline:
+            raise SystemExit(
+                f"Local Bot API not ready after {max_wait}s (Telegram flood limit?). "
+                "Wait 5-10 minutes before re-running, and make sure no other run or bot "
+                "is using this token."
+            )
+        time.sleep(pause)
 
 
-def main():
-    load_settings()
-    cleanup_stale_workdirs()
-    if LOCAL_BOT_API:
-        wait_for_bot_api()
-    STATE["started"] = time.monotonic()
+def build_app():
     builder = (
         Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init)
         .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
@@ -1468,7 +1476,6 @@ def main():
             .base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
             .local_mode(True)
         )
-        log.info("Using Local Bot API at %s", LOCAL_BOT_API_URL)
 
     app = builder.build()
     app.add_handler(TypeHandler(Update, gate), group=-1)
@@ -1493,10 +1500,36 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
+    return app
+
+
+def main():
+    load_settings()
+    cleanup_stale_workdirs()
+    if LOCAL_BOT_API:
+        wait_for_bot_api()
+        log.info("Using Local Bot API at %s", LOCAL_BOT_API_URL)
+    STATE["started"] = time.monotonic()
 
     log.info("Bot starting; local API=%s; part size=%s MB / %s h; workers=%s; session=%s min",
              LOCAL_BOT_API, SEND_PART_MB, MAX_PART_HOURS, TTS_CONCURRENCY, SESSION_MINUTES)
-    app.run_polling(drop_pending_updates=False)
+
+    # PTB calls getMe during initialize(). If Telegram still answers with a flood wait,
+    # sleep for it and retry with a fresh Application instead of crashing the workflow.
+    max_start_attempts = 6
+    for attempt in range(1, max_start_attempts + 1):
+        asyncio.set_event_loop(asyncio.new_event_loop())   # run_polling closes its loop on failure
+        app = build_app()
+        try:
+            app.run_polling(drop_pending_updates=False)
+            return
+        except RetryAfter as exc:
+            wait = int(getattr(exc, "retry_after", 30)) + 2
+            if attempt == max_start_attempts:
+                raise
+            log.warning("Telegram flood control on startup (attempt %s/%s); retrying in %ss.",
+                        attempt, max_start_attempts, wait)
+            time.sleep(wait)
 
 
 if __name__ == "__main__":
