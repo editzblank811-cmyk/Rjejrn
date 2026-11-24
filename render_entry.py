@@ -56,5 +56,8 @@ def start_keepalive():
 if __name__ == "__main__":
     start_health_server()
     start_keepalive()
-    import tts_bot_fixed
-    tts_bot_fixed.main()
+    try:
+        import tts_bot_fixed as bot_module
+    except ModuleNotFoundError:
+        import bot as bot_module        # fallback if the bot file is named bot.py
+    bot_module.main()
