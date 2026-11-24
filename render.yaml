@@ -1,0 +1,22 @@
+services:
+  - type: web                 # free plan. For a paid always-on service use: type: worker
+    name: telegram-tts-bot
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false           # paste the value in the Render dashboard
+      - key: ALLOWED_USERS
+        sync: false           # your Telegram user id(s), e.g. 123456789
+      - key: LOCAL_BOT_API
+        value: "0"            # Render has no local Bot API container -> 50 MB upload limit
+      - key: SESSION_MINUTES
+        value: "0"            # 0 = run forever
+      - key: DEFAULT_VOICE
+        value: hi-IN-MadhurNeural
+      - key: DEFAULT_RATE
+        value: "1.5"
+      - key: TTS_CONCURRENCY
+        value: "4"            # free plan has little CPU/RAM
